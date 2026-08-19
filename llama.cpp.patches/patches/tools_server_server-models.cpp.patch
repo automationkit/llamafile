@@ -1,0 +1,144 @@
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+--- a/llama.cpp/tools/server/server-models.cpp
++++ b/llama.cpp/tools/server/server-models.cpp
+@@ -30,6 +30,7 @@
+ #include <cstring>
+ 
+ #ifndef _WIN32
++#include <csignal>
+ extern char **environ;
+ #endif
+ 
+@@ -508,13 +509,19 @@ void server_models::load_models() {
+         }
+ 
+         // wait for all targeted models to reach UNLOADED; cv.wait handles unlock/relock
+-        cv.wait(lk, [&]() {
++        // Use wait_for() instead of wait() to work around a Cosmopolitan libc bug
++        // where untimed futex waits on XNU (macOS) expire after ~72 minutes,
++        // causing condition_variable::wait() to throw ETIMEDOUT.
++        auto all_unloaded = [&]() {
+             for (const auto & name : to_unload) {
+                 auto it = mapping.find(name);
+                 if (it != mapping.end() && it->second.meta.is_running()) return false;
+             }
+             return true;
+-        });
++        };
++        while (!all_unloaded()) {
++            cv.wait_for(lk, std::chrono::seconds(30));
++        }
+ 
+         // collect all threads to join in one pass while the lock is held:
+         // - monitoring threads from just-unloaded models (to_unload)
+@@ -765,9 +772,12 @@ void server_models::unload_lru() {
+         // wait for unload to complete
+         {
+             std::unique_lock<std::mutex> lk(mutex);
+-            cv.wait(lk, [this, &lru_model_name]() {
+-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+-            });
++            // Use wait_for() instead of wait() to work around a Cosmopolitan libc
++            // bug where untimed futex waits on XNU (macOS) expire after ~72 minutes,
++            // causing condition_variable::wait() to throw ETIMEDOUT.
++            while (mapping[lru_model_name].meta.status != SERVER_MODEL_STATUS_UNLOADED) {
++                cv.wait_for(lk, std::chrono::seconds(30));
++            }
+         }
+     }
+ }
+@@ -787,7 +797,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
+     std::unique_lock<std::mutex> lk(mutex);
+     // edge case: block until any in-progress reload has finished so we always load
+     // against the freshest preset and a consistent mapping state
+-    cv.wait(lk, [this]() { return !is_reloading; });
++    // Use wait_for() instead of wait() to work around a Cosmopolitan libc bug
++    // where untimed futex waits on XNU (macOS) expire after ~72 minutes,
++    // causing condition_variable::wait() to throw ETIMEDOUT.
++    while (is_reloading) {
++        cv.wait_for(lk, std::chrono::seconds(30));
++    }
+ 
+     auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : mapping[name].meta;
+     if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+@@ -889,15 +904,34 @@ void server_models::load(const std::string & name, const load_options & opts) {
+         });
+ 
+         std::thread stopping_thread([&]() {
++            // Block every signal on this thread so pthread_cond_timedwait()
++            // can't be interrupted with EINTR (libcxx rethrows EINTR as
++            // std::system_error and std::terminates the process). Keep
++            // synchronous fault signals deliverable so real crashes still
++            // surface.
++            sigset_t block_mask;
++            sigfillset(&block_mask);
++            sigdelset(&block_mask, SIGSEGV);
++            sigdelset(&block_mask, SIGBUS);
++            sigdelset(&block_mask, SIGILL);
++            sigdelset(&block_mask, SIGFPE);
++            sigdelset(&block_mask, SIGABRT);
++            sigdelset(&block_mask, SIGSYS);
++            sigdelset(&block_mask, SIGTRAP);
++            pthread_sigmask(SIG_BLOCK, &block_mask, nullptr);
++
+             // thread to monitor explicit stop requests; child crash is signalled via child_proc->stopped
+             auto is_stopping = [this, &name]() {
+                 return this->stopping_models.find(name) != this->stopping_models.end();
+             };
+             {
+                 std::unique_lock<std::mutex> lk(this->mutex);
+-                this->cv_stop.wait(lk, [&]() {
+-                    return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
+-                });
++                // Use wait_for() instead of wait() to work around a Cosmopolitan
++                // libc bug where untimed futex waits on XNU (macOS) expire after
++                // ~72 minutes, causing condition_variable::wait() to throw ETIMEDOUT.
++                while (!(is_stopping() || child_proc->stopped.load(std::memory_order_acquire))) {
++                    this->cv_stop.wait_for(lk, std::chrono::seconds(30));
++                }
+             }
+             // child crashed or finished on its own, skip graceful shutdown sequence
+             if (child_proc->stopped.load(std::memory_order_acquire)) {
+@@ -1164,16 +1198,22 @@ void server_models::wait(const std::string & name, std::function<bool(const serv
+ }
+ 
+ void server_models::wait(std::unique_lock<std::mutex> & lk, const std::string & name, std::function<bool(const server_model_meta &)> predicate) {
+-    cv.wait(lk, [this, &name, &predicate]() {
++    // Use wait_for() instead of wait() to work around a Cosmopolitan libc bug
++    // where untimed futex waits on XNU (macOS) expire after ~72 minutes,
++    // causing condition_variable::wait() to throw ETIMEDOUT.
++    while (true) {
+         auto it = mapping.find(name);
+         if (it != mapping.end()) {
+-            return predicate(it->second.meta);
+-
++            if (predicate(it->second.meta)) {
++                break;
++            }
++        } else {
++            // model was removed from mapping by another code path (e.g. load_models()).
++            // nothing left to wait for - tell the caller to proceed.
++            break;
+         }
+-        // model was removed from mapping by another code path (e.g. load_models()).
+-        // nothing left to wait for - tell the caller to proceed.
+-        return true;
+-    });
++        cv.wait_for(lk, std::chrono::seconds(30));
++    }
+ }
+ 
+ bool server_models::ensure_model_ready(const std::string & name) {
+@@ -2103,10 +2143,10 @@ server_http_proxy::server_http_proxy(
+     auto pipe = std::make_shared<pipe_t<msg_t>>();
+ 
+     if (scheme == "https") {
+-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
++#ifdef CPPHTTPLIB_SSL_ENABLED
+         cli.reset(new httplib::SSLClient(host, port));
+ #else
+-        throw std::runtime_error("HTTPS requested but CPPHTTPLIB_OPENSSL_SUPPORT is not defined");
++        throw std::runtime_error("HTTPS requested but the server is built without SSL support");
+ #endif
+     }
+ 
